@@ -316,7 +316,9 @@ class Maildir < Source
     end
 
     labels = labels.sort
-    header = Set.new(load_header(id)['x-keywords'].split(/, */)).sort
+    current_x_keywords = load_header(id)['x-keywords']
+    current_x_keywords = "" if not current_x_keywords
+    header = Set.new(current_x_keywords.split(/, */)).sort
     debug "XKEY update keywords #{header} -> #{labels}"
 
     # If the labels didn't change, then bail out
