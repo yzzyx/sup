@@ -345,16 +345,20 @@ class Maildir < Source
             # X-Keywords headers.  We don't want to 
             # write duplicate headers back out
             keywords_header_seen = false
+            in_headers = true
             File.open(tmp_path, 'wb') do |f|
               each_raw_message_line(id) do |m|
-                if m =~ /^X-Keywords: .*\n/ && !keywords_header_seen then
-                  f.puts("X-Keywords: #{header}\n")
+                if in_headers and m =~ /^X-Keywords: .*\n/ then
+                  f.puts("X-Keywords: #{header}\n") if not keywords_header_seen
                   keywords_header_seen = true
-                elsif m =~ /^X-Keywords: .*\n/ && keywords_header_seen then
                   next
-                else
-                  f.puts(m)
+                elsif in_headers and m =~ /^\n/ then
+                  # We're at the end of headers, and we still haven't seen X-Keywords, so
+                  # we'll add it ourselves
+                  f.puts("X-Keywords: #{header}\n") if not keywords_header_seen
+                  in_headers = false
                 end
+                f.puts(m)
               end
               f.fsync()
               f.close()
