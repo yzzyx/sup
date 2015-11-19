@@ -264,12 +264,26 @@ class Message
         parse_header rmsg.header
         message_to_chunks rmsg
       rescue SourceError, SocketError, RMail::EncodingUnsupportedError => e
-        warn "problem reading message #{id}"
+        warn_with_location "problem reading message #{id}"
         debug "could not load message: #{location.inspect}, exception: #{e.inspect}"
 
         [Chunk::Text.new(error_message.split("\n"))]
+
+      rescue Exception => e
+
+        warn_with_location "problem reading message #{id}"
+        debug "could not load message: #{location.inspect}, exception: #{e.inspect}"
+
+        raise e
+
       end
   end
+
+  def reload_from_source!
+    @chunks = nil
+    load_from_source!
+  end
+
 
   def error_message
     <<EOS
@@ -327,17 +341,17 @@ EOS
       to.map { |p| p.indexable_content },
       cc.map { |p| p.indexable_content },
       bcc.map { |p| p.indexable_content },
-      indexable_chunks.map { |c| c.lines },
+      indexable_chunks.map { |c| c.lines.map { |l| l.fix_encoding! } },
       indexable_subject,
     ].flatten.compact.join " "
   end
 
   def indexable_body
-    indexable_chunks.map { |c| c.lines }.flatten.compact.join " "
+    indexable_chunks.map { |c| c.lines }.flatten.compact.map { |l| l.fix_encoding! }.join " "
   end
 
   def indexable_chunks
-    chunks.select { |c| c.is_a? Chunk::Text } || []
+    chunks.select { |c| c.indexable? } || []
   end
 
   def indexable_subject
@@ -390,19 +404,19 @@ private
 
   def multipart_signed_to_chunks m
     if m.body.size != 2
-      warn "multipart/signed with #{m.body.size} parts (expecting 2)"
+      warn_with_location "multipart/signed with #{m.body.size} parts (expecting 2)"
       return
     end
 
     payload, signature = m.body
     if signature.multipart?
-      warn "multipart/signed with payload multipart #{payload.multipart?} and signature multipart #{signature.multipart?}"
+      warn_with_location "multipart/signed with payload multipart #{payload.multipart?} and signature multipart #{signature.multipart?}"
       return
     end
 
     ## this probably will never happen
     if payload.header.content_type && payload.header.content_type.downcase == "application/pgp-signature"
-      warn "multipart/signed with payload content type #{payload.header.content_type}"
+      warn_with_location "multipart/signed with payload content type #{payload.header.content_type}"
       return
     end
 
@@ -417,23 +431,23 @@ private
 
   def multipart_encrypted_to_chunks m
     if m.body.size != 2
-      warn "multipart/encrypted with #{m.body.size} parts (expecting 2)"
+      warn_with_location "multipart/encrypted with #{m.body.size} parts (expecting 2)"
       return
     end
 
     control, payload = m.body
     if control.multipart?
-      warn "multipart/encrypted with control multipart #{control.multipart?} and payload multipart #{payload.multipart?}"
+      warn_with_location "multipart/encrypted with control multipart #{control.multipart?} and payload multipart #{payload.multipart?}"
       return
     end
 
     if payload.header.content_type && payload.header.content_type.downcase != "application/octet-stream"
-      warn "multipart/encrypted with payload content type #{payload.header.content_type}"
+      warn_with_location "multipart/encrypted with payload content type #{payload.header.content_type}"
       return
     end
 
     if control.header.content_type && control.header.content_type.downcase != "application/pgp-encrypted"
-      warn "multipart/encrypted with control content type #{signature.header.content_type}"
+      warn_with_location "multipart/encrypted with control content type #{signature.header.content_type}"
       return
     end
 
@@ -736,6 +750,11 @@ private
       chunks << Chunk::Signature.new(chunk_lines) unless chunk_lines.empty?
     end
     chunks
+  end
+
+  def warn_with_location msg
+    warn msg
+    warn "Message is in #{location.source.uri} at #{location.info}"
   end
 end
 

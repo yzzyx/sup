@@ -1,6 +1,5 @@
 # encoding: utf-8
 
-require 'rubygems'
 require 'yaml'
 require 'zlib'
 require 'thread'
@@ -8,6 +7,7 @@ require 'fileutils'
 require 'locale'
 require 'ncursesw'
 require 'rmail'
+require 'uri'
 begin
   require 'fastthread'
 rescue LoadError
@@ -64,6 +64,7 @@ module Redwood
   LEGACY_YAML_DOMAIN = "masanjin.net"
   YAML_DATE = "2006-10-01"
   MAILDIR_SYNC_CHECK_SKIPPED = 'SKIPPED'
+  URI_ENCODE_CHARS = "!*'();:@&=+$,?#[] " # see https://en.wikipedia.org/wiki/Percent-encoding
 
   ## record exceptions thrown in threads nicely
   @exceptions = []
@@ -103,7 +104,7 @@ module Redwood
       o
     end
 
-    mode = if File.exists? fn
+    mode = if File.exist? fn
       File.stat(fn).mode
     else
       0600
@@ -111,7 +112,7 @@ module Redwood
 
     if backup
       backup_fn = fn + '.bak'
-      if File.exists?(fn) && File.size(fn) > 0
+      if File.exist?(fn) && File.size(fn) > 0
         File.open(backup_fn, "w", mode) do |f|
           File.open(fn, "r") { |old_f| FileUtils.copy_stream old_f, f }
           f.fsync
@@ -137,7 +138,7 @@ module Redwood
   end
 
   def load_yaml_obj fn, compress=false
-    o = if File.exists? fn
+    o = if File.exist? fn
       if compress
         Zlib::GzipReader.open(fn) { |f| YAML::load f }
       else
@@ -178,7 +179,7 @@ module Redwood
     return if bypass_sync_check
 
     if $config[:sync_back_to_maildir]
-      if not File.exists? Redwood::SYNC_OK_FN
+      if not File.exist? Redwood::SYNC_OK_FN
         Redwood.warn_syncback <<EOS
 It appears that the "sync_back_to_maildir" option has been changed
 from false to true since the last execution of sup.
@@ -189,14 +190,14 @@ Should I complain about this again? (Y/n)
 EOS
         File.open(Redwood::SYNC_OK_FN, 'w') {|f| f.write(Redwood::MAILDIR_SYNC_CHECK_SKIPPED) } if STDIN.gets.chomp.downcase == 'n'
       end
-    elsif not $config[:sync_back_to_maildir] and File.exists? Redwood::SYNC_OK_FN
+    elsif not $config[:sync_back_to_maildir] and File.exist? Redwood::SYNC_OK_FN
       File.delete(Redwood::SYNC_OK_FN)
     end
   end
 
   def check_syncback_settings
     # don't check if syncback was never performed
-    return unless File.exists? Redwood::SYNC_OK_FN
+    return unless File.exist? Redwood::SYNC_OK_FN
     active_sync_sources = File.readlines(Redwood::SYNC_OK_FN).collect { |e| e.strip }.find_all { |e| not e.empty? }
     return if active_sync_sources.length == 1 and active_sync_sources[0] == Redwood::MAILDIR_SYNC_CHECK_SKIPPED
     sources = SourceManager.sources
@@ -330,6 +331,7 @@ EOM
       :poll_interval => 300,
       :wrap_width => 0,
       :slip_rows => 0,
+      :indent_spaces => 2,
       :col_jump => 2,
       :stem_language => "english",
       :sync_back_to_maildir => false,
@@ -337,7 +339,7 @@ EOM
       :always_edit_async => false,
       :sync_labels_to_xkeywords => false,
     }
-    if File.exists? filename
+    if File.exist? filename
       config = Redwood::load_yaml_obj filename
       abort "#{filename} is not a valid configuration file (it's a #{config.class}, not a hash)" unless config.is_a?(Hash)
       default_config.merge config

@@ -10,8 +10,6 @@ class ThreadViewMode < LineCursorMode
     attr_accessor :state
   end
 
-  INDENT_SPACES = 2 # how many spaces to indent child messages
-
   HookManager.register "detailed-headers", <<EOS
 Add or remove headers from the detailed header display of a message.
 Variables:
@@ -38,6 +36,14 @@ EOS
 Executed when a message or a chunk is requested to be published.
 Variables:
      chunk: Redwood::Message or Redwood::Chunk::* to be published.
+Return value:
+  None.
+EOS
+
+  HookManager.register "goto", <<EOS
+Open the uri given as a parameter.
+Variables:
+      uri: The uri
 Return value:
   None.
 EOS
@@ -80,6 +86,9 @@ EOS
     k.add :kill_and_next, "Kill this thread, kill buffer, and view next", '&'
     k.add :toggle_wrap, "Toggle wrapping of text", 'w'
 
+    k.add :goto_uri, "Goto uri under cursor", 'g'
+    k.add :fetch_and_verify, "Fetch the PGP key on poolserver and re-verify message", "v"
+
     k.add_multi "(a)rchive/(d)elete/mark as (s)pam/mark as u(N)read:", '.' do |kk|
       kk.add :archive_and_kill, "Archive this thread and kill buffer", 'a'
       kk.add :delete_and_kill, "Delete this thread and kill buffer", 'd'
@@ -116,6 +125,7 @@ EOS
   ## objects. @person_lines is a map from row #s to Person objects.
 
   def initialize thread, hidden_labels=[], index_mode=nil
+    @indent_spaces = $config[:indent_spaces]
     super :slip_rows => $config[:slip_rows]
     @thread = thread
     @hidden_labels = hidden_labels
@@ -214,10 +224,24 @@ EOS
 
   def unsubscribe_from_list
     m = @message_lines[curpos] or return
-    if m.list_unsubscribe && m.list_unsubscribe =~ /<mailto:(.*?)(\?subject=(.*?))?>/
+    BufferManager.flash "Can't find List-Unsubscribe header for this message." unless m.list_unsubscribe
+
+    if m.list_unsubscribe =~ /<mailto:(.*?)(\?subject=(.*?))?>/
       ComposeMode.spawn_nicely :from => AccountManager.account_for(m.recipient_email), :to => [Person.from_address($1)], :subj => ($3 || "unsubscribe")
-    else
-      BufferManager.flash "Can't find List-Unsubscribe header for this message."
+    elsif m.list_unsubscribe =~ /<(http.*)?>/
+      unless HookManager.enabled? "goto"
+        BufferManager.flash "You must add a goto.rb hook before you can goto an unsubscribe URI."
+        return
+      end
+
+      begin
+        u = URI.parse($1)
+      rescue URI::InvalidURIError => e
+        BufferManager.flash("Invalid unsubscribe link")
+        return
+      end
+
+      HookManager.run "goto", :uri => Shellwords.escape(u.to_s)
     end
   end
 
@@ -364,7 +388,7 @@ EOS
     when Chunk::Attachment
       default_dir = $config[:default_attachment_save_dir]
       default_dir = ENV["HOME"] if default_dir.nil? || default_dir.empty?
-      default_fn = File.expand_path File.join(default_dir, chunk.filename)
+      default_fn = File.expand_path File.join(default_dir, chunk.safe_filename)
       fn = BufferManager.ask_for_filename :filename, "Save attachment to file or directory: ", default_fn, true
 
       # if user selects directory use file name from message
@@ -393,7 +417,7 @@ EOS
     num_errors = 0
     m.chunks.each do |chunk|
       next unless chunk.is_a?(Chunk::Attachment)
-      fn = File.join(folder, chunk.filename)
+      fn = File.join(folder, chunk.safe_filename)
       num_errors += 1 unless save_to_file(fn, false) { |f| f.print chunk.raw_content }
       num += 1
     end
@@ -536,7 +560,7 @@ EOS
     l = @layout[m]
 
     ## boundaries of the message
-    message_left = l.depth * INDENT_SPACES
+    message_left = l.depth * @indent_spaces
     message_right = message_left + l.width
 
     ## calculate leftmost colum
@@ -698,12 +722,17 @@ EOS
     command = BufferManager.ask(:shell, "pipe command: ")
     return if command.nil? || command.empty?
 
-    output = pipe_to_process(command) do |stream|
+    output, success = pipe_to_process(command) do |stream|
       if chunk
         stream.print chunk.raw_content
       else
         message.each_raw_message_line { |l| stream.print l }
       end
+    end
+
+    unless success
+      BufferManager.flash "Invalid command: '#{command}' is not an executable"
+      return
     end
 
     if output
@@ -720,6 +749,69 @@ EOS
     end.compact.join(",")
     user_labels = (user_labels.empty? and "" or "<#{user_labels}>")
     [user_labels, super].join(" -- ")
+  end
+
+  def goto_uri
+    unless (chunk = @chunk_lines[curpos])
+      BufferManager.flash "No URI found."
+      return
+    end
+    unless HookManager.enabled? "goto"
+      BufferManager.flash "You must add a goto.rb hook before you can goto a URI."
+      return
+    end
+
+    # @text is a list of lines with this format:
+    # [
+    #   [[:text_color, "Some text"]]
+    #   [[:text_color, " continued here"]]
+    # ]
+
+    linetext = @text.slice(curpos, @text.length).flatten(1)
+      .take_while{|d| d[0] == :text_color and d[1].strip != ""} # Only take up to the first "" alone on its line
+      .map{|d| d[1].strip}.join("").strip
+
+    found = false
+    (linetext || "").scan(URI::regexp).each do |matches|
+      begin
+        link = $& # ruby magic: $& is the whole regexp match
+        u = URI.parse(link)
+        next unless u.absolute?
+        next unless ["http", "https"].include?(u.scheme)
+
+        reallink = Shellwords.escape(u.to_s)
+        BufferManager.flash "Going to #{reallink} ..."
+        HookManager.run "goto", :uri => reallink
+        BufferManager.completely_redraw_screen
+        found = true
+
+      rescue URI::InvalidURIError => e
+        debug "not a uri: #{e}"
+        # Do nothing, this is an ok flow
+      end
+    end
+    BufferManager.flash "No URI found." unless found
+  end
+
+  def fetch_and_verify
+    message = @message_lines[curpos]
+    crypto_chunk = message.chunks.select {|chunk| chunk.is_a?(Chunk::CryptoNotice)}.first
+    return unless crypto_chunk
+    return unless crypto_chunk.unknown_fingerprint
+
+    BufferManager.flash "Retrieving key #{crypto_chunk.unknown_fingerprint} ..."
+
+    error = CryptoManager.retrieve crypto_chunk.unknown_fingerprint
+
+    if error
+      BufferManager.flash "Couldn't retrieve key: #{error.to_s}"
+    else
+      BufferManager.flash "Key #{crypto_chunk.unknown_fingerprint} successfully retrieved !"
+    end
+
+    # Re-trigger gpg verification
+    message.reload_from_source!
+    update
   end
 
 private
@@ -793,7 +885,7 @@ private
           (0 ... text.length).each do |i|
             @chunk_lines[@text.length + i] = c
             @message_lines[@text.length + i] = m
-            lw = text[i].flatten.select { |x| x.is_a? String }.map { |x| x.display_length }.sum - (depth * INDENT_SPACES)
+            lw = text[i].flatten.select { |x| x.is_a? String }.map { |x| x.display_length }.sum - (depth * @indent_spaces)
             l.width = lw if lw > l.width
           end
           @text += text
@@ -847,9 +939,10 @@ private
         addressee_lines += format_person_list "   Bcc: ", m.bcc
       end
 
-      headers = OrderedHash.new
-      headers["Date"] = "#{m.date.to_message_nice_s} (#{m.date.to_nice_distance_s})"
-      headers["Subject"] = m.subj
+      headers = {
+        "Date" => "#{m.date.to_message_nice_s} (#{m.date.to_nice_distance_s})",
+        "Subject" => m.subj
+      }
 
       show_labels = @thread.labels - LabelManager::HIDDEN_RESERVED_LABELS
       unless show_labels.empty?
@@ -897,7 +990,7 @@ private
 
   ## todo: check arguments on this overly complex function
   def chunk_to_lines chunk, state, start, depth, parent=nil, color=nil, star_color=nil
-    prefix = " " * INDENT_SPACES * depth
+    prefix = " " * @indent_spaces * depth
     case chunk
     when :fake_root
       [[[:missing_message_color, "#{prefix}<one or more unreceived messages>"]]]
